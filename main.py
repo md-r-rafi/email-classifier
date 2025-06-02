@@ -1,0 +1,261 @@
+# main.py (or app.py, or whatever you want to call this single file)
+
+import os
+import json
+import re # Import regex for cleaning LLM output
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, RootModel # Need RootModel for List response
+import uvicorn
+
+# --- 1. Environment Variable Loading ---
+# Assuming you have a .env file or set the variable in your environment
+from dotenv import load_dotenv
+load_dotenv()
+
+# --- 2. Gemini Configuration and Model Initialization ---
+import google.generativeai as genai
+
+# Use os.getenv to read from the environment variable (recommended)
+GOOGLE_API_KEY = "AIzaSyDeIlSY_Pg9DCeWrKig1-uZDzL-8HnZon8"
+
+if not GOOGLE_API_KEY:
+    # Provide a helpful error if the key is not set
+    raise ValueError(
+        "GOOGLE_API_KEY environment variable not set. "
+        "Please set it in your environment or create a .env file in the project root "
+        "with GOOGLE_API_KEY='YOUR_API_KEY'."
+    )
+
+try:
+    genai.configure(api_key=GOOGLE_API_KEY)
+    # Initialize the Gemini model instance once globally
+    gemini_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+    print("Gemini model configured and loaded successfully.")
+
+except Exception as e:
+    print(f"FATAL ERROR: Could not initialize Gemini model: {e}")
+    # Re-raise the exception to stop the application startup if the model can't load
+    raise RuntimeError(f"Failed to initialize Gemini model: {e}") from e
+
+# --- 3. Constants and Prompt Generation Logic (Copied from core/prompts.py) ---
+
+# Define the list of valid tags
+EMAIL_TAGS = [
+    "Bug Report",
+    "Billing Issue",
+    "Praise",
+    "Complaint",
+    "Feature Request",
+    "Technical Support",
+    "Sales Inquiry",
+    "Security Concern",
+    "Spam/Irrelevant",
+    "Refund Request",
+    "Shipping/Delivery",
+    "Other",
+]
+
+def get_prompt_batch(email_list: List[str]) -> str:
+  """
+  Generates the prompt string for the Gemini API to classify a list of emails.
+
+  Args:
+    email_list: A list of customer email contents (strings).
+
+  Returns:
+    A string containing the prompt for the LLM to classify all emails in the list
+    and return a JSON array.
+  """
+
+  if not email_list:
+      return "" # Return empty string for empty list as per original logic
+
+
+  # Format the tags into a readable list string for the prompt
+  tags_list_str = "\n".join([f"- {tag}" for tag in EMAIL_TAGS])
+
+  # Format the list of emails for the prompt, adding clear separators and numbering
+  emails_formatted = "\n---\n".join([f"Email {i+1}:\n{email}" for i, email in enumerate(email_list)])
+
+  prompt = f"""
+You are an expert email classification assistant. You will be provided with a list of customer emails. Your task is to read each email individually and determine which of the predefined tags from the list below best apply to its content.
+
+Analyze each email carefully to identify the primary topic(s) and the user's intent.
+
+**Available Tags:**
+{tags_list_str}
+
+**Instructions:**
+1.  Review each email content thoroughly, one by one, following the "Email 1:", "Email 2:", etc. structure.
+2.  For each email, select one or more tags from the "Available Tags" list that accurately reflect its subject matter.
+3.  If an email fits multiple categories, include all relevant tags for that email.
+4.  If an email doesn't clearly fit any of the specific categories, use the "Other" tag for that email.
+5.  If an email is irrelevant, promotional spam, or has no discernible meaning, use the "Spam/Irrelevant" tag for that email.
+6.  **Your response MUST be ONLY a JSON array.** Do not include any extra text, explanations, or markdown formatting (like triple backticks).
+7.  The JSON array MUST contain one object for each email provided in the input.
+8.  Each object in the array MUST have a single key: "tags".
+9.  The value associated with the "tags" key MUST be a JSON array (list) containing the selected tag names as strings for the corresponding email.
+10. **The order of objects in the JSON array MUST exactly match the order of the emails provided in the "Emails to Classify" section below (e.g., the first object in the array is for "Email 1", the second for "Email 2", and so on).**
+11. Each tag name in the JSON array MUST exactly match a tag name from the "Available Tags" list provided above.
+
+**Expected Response Format (JSON array only):**
+[
+  {{"tags": ["Tag Name for Email 1", "Another Tag for Email 1"]}},
+  {{"tags": ["Tag Name for Email 2"]}},
+  {{"tags": ["Tag Name for Email 3", "..."]}}
+]
+
+---
+**Emails to Classify:**
+{emails_formatted}
+---
+"""
+  return prompt
+
+
+# --- 4. LLM Interaction Logic (Integrated) ---
+# Adapted from core/llm_service.py, accessing the global gemini_model
+
+async def classify_emails_with_gemini(prompt: str) -> List[Dict[str, List[str]]]:
+    """
+    Sends the prompt to the Gemini model, gets the response, and parses the JSON.
+
+    Args:
+        prompt: The prompt string generated by get_prompt_batch.
+
+    Returns:
+        A list of dictionaries, where each dict represents the classification
+        for one email in the batch, e.g., [{"tags": ["Tag1", "Tag2"]}, ...].
+
+    Raises:
+        ValueError: If the gemini_model is not initialized (shouldn't happen after startup).
+        RuntimeError: If the LLM API call fails or returns unexpected content.
+        json.JSONDecodeError: If the LLM response is not valid JSON.
+    """
+    global gemini_model # Declare we are using the global variable
+    if gemini_model is None:
+        # This check is mostly for safety; startup should fail if model isn't loaded.
+        raise RuntimeError("Gemini model is not initialized.")
+
+    try:
+        # Call the Gemini API using the globally initialized model instance
+        gemini_response = await gemini_model.generate_content(prompt)
+
+        # Extract text response
+        if not gemini_response or not gemini_response.text:
+            print(f"Warning: Gemini response text is empty or None: {gemini_response}")
+            if hasattr(gemini_response, 'candidates') and gemini_response.candidates:
+                 print(f"Candidates: {gemini_response.candidates}")
+            raise RuntimeError("LLM returned empty or invalid response.")
+
+        json_string = gemini_response.text.strip()
+        print(f"Raw LLM response text: {json_string}") # Log raw response
+
+        # Cleaning: remove potential markdown code block wrappers (```json ... ```)
+        json_string = re.sub(r"^\s*```json\s*", "", json_string)
+        json_string = re.sub(r"\s*```\s*$", "", json_string)
+        json_string = json_string.strip() # Clean up any remaining whitespace
+
+        # Parse the JSON string
+        classification_results = json.loads(json_string)
+        print(f"Parsed JSON: {classification_results}") # Log parsed result
+
+        # Basic structural validation: Ensure it's a list
+        if not isinstance(classification_results, list):
+             raise ValueError(f"LLM returned invalid structure (not a list). Got: {type(classification_results)}")
+
+        # Optional: Add more validation here, e.g., checking if each item
+        # is a dict with a 'tags' key that's a list of strings.
+        # For simplicity in this single file, we'll trust the LLM output structure
+        # matches the prompt instructions after initial list check.
+
+        return classification_results
+
+    except json.JSONDecodeError as e:
+        print(f"JSON Decode Error: {e}")
+        # Include the problematic string in the error for debugging
+        raise json.JSONDecodeError(f"Failed to parse LLM response as JSON: {e}. Raw text: {json_string[:500]}...", e.doc, e.pos) from e
+
+    except Exception as e:
+        print(f"An unexpected error occurred during LLM interaction: {e}")
+        raise RuntimeError(f"LLM interaction failed: {e}") from e
+
+
+# --- 5. Pydantic Models for Request/Response ---
+
+# Define the request body model
+class EmailListRequest(BaseModel):
+    emails: List[str] = Field(..., description="An array of email text strings to classify.")
+
+# Define the response structure for a single email's classification
+class TaggedEmailResult(BaseModel):
+    tags: List[str] = Field(..., description="A list of tags assigned to the email.")
+
+# Define the overall response structure, which is a list of TaggedEmailResult
+# Use RootModel for a simple list response body
+class EmailClassificationResponse(RootModel[List[TaggedEmailResult]]):
+     # No Config class needed here for this use case in Pydantic V2
+     pass # Or just leave it empty after the RootModel definition
+
+# --- 6. FastAPI App and Endpoint Definition ---
+
+app = FastAPI(
+    title="Email Classifier API",
+    description="API to classify email text into predefined tags using a Large Language Model.",
+    version="1.0.0",
+)
+
+@app.post(
+    "/classify",
+    response_model=EmailClassificationResponse, # Document the expected output format
+    summary="Classify a list of emails",
+    description="Takes an array of email text strings and returns an array of classification objects.",
+)
+async def classify_emails_endpoint(request_data: EmailListRequest):
+    """
+    Receives a list of email strings, uses the LLM to classify them,
+    and returns the classification results.
+    """
+    email_list = request_data.emails
+
+    if not email_list:
+        print("Received empty email list, returning empty result.")
+        return [] # FastAPI/Pydantic handles empty list correctly for the response model
+
+    try:
+        # 1. Generate the prompt
+        prompt = get_prompt_batch(email_list)
+
+        # 2. Call the integrated LLM interaction function
+        print("Calling LLM service function...")
+        classification_results = await classify_emails_with_gemini(prompt)
+        print("LLM service call finished.")
+
+        # 3. Return the result
+        # Pydantic RootModel will validate/serialize the list
+        return classification_results
+
+    except (ValueError, RuntimeError, json.JSONDecodeError) as e:
+        # Catch specific errors raised by our LLM interaction logic
+        print(f"Error during classification process: {e}")
+        raise HTTPException(status_code=500, detail=f"Classification failed: {e}")
+
+    except Exception as e:
+        # Catch any other unexpected errors
+        print(f"An unexpected error occurred in the endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
+
+
+# Add a simple root endpoint for health check (Optional but good practice)
+@app.get("/")
+async def read_root():
+    return {"message": "Email Classifier API is running. Access docs at /docs or /redoc"}
+
+
+# --- 7. Uvicorn Entry Point ---
+
+if __name__ == "__main__":
+    # Use reload=True for development. Set host/port as needed.
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
