@@ -18,7 +18,7 @@ load_dotenv()
 import google.generativeai as genai
 
 # Use os.getenv to read from the environment variable (recommended)
-GOOGLE_API_KEY = "AIzaSyDeIlSY_Pg9DCeWrKig1-uZDzL-8HnZon8"
+GOOGLE_API_KEY = "AIzaSyCcgTu-QUDQG_yWH2jOl-iE04DsvfTQfSI"
 
 if not GOOGLE_API_KEY:
     # Provide a helpful error if the key is not set
@@ -31,7 +31,7 @@ if not GOOGLE_API_KEY:
 try:
     genai.configure(api_key=GOOGLE_API_KEY)
     # Initialize the Gemini model instance once globally
-    gemini_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
     print("Gemini model configured and loaded successfully.")
 
 except Exception as e:
@@ -141,7 +141,7 @@ async def classify_emails_with_gemini(prompt: str) -> List[Dict[str, List[str]]]
 
     try:
         # Call the Gemini API using the globally initialized model instance
-        gemini_response = await gemini_model.generate_content(prompt)
+        gemini_response =  gemini_model.generate_content(prompt)
 
         # Extract text response
         if not gemini_response or not gemini_response.text:
